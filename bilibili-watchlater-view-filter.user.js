@@ -9,6 +9,10 @@
 // @grant        none
 // @run-at       document-idle
 // @license      MIT
+// @homepageURL  https://github.com/ShirasawaYui/bilibili-watchlater-view-filter
+// @supportURL   https://github.com/ShirasawaYui/bilibili-watchlater-view-filter/issues
+// @downloadURL  https://github.com/ShirasawaYui/bilibili-watchlater-view-filter/raw/main/bilibili-watchlater-view-filter.user.js
+// @updateURL    https://github.com/ShirasawaYui/bilibili-watchlater-view-filter/raw/main/bilibili-watchlater-view-filter.user.js
 // ==/UserScript==
 /*
  * 思路致谢（MIT，未复制其代码）：
