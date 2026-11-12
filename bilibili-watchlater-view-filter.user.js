@@ -1,0 +1,386 @@
+// ==UserScript==
+// @name         B站稍后再看 · 播放量筛选
+// @namespace    wlvf.mellie.local
+// @version      0.1.2
+// @description  在 B 站稍后再看列表按播放量阈值筛选卡片（隐藏/淡化双模式）。判定恒为 ≥，默认阈值 10000、默认不启用，数据来自列表接口精确值。
+// @author       结衣 & 梅莉
+// @match        https://www.bilibili.com/watchlater/list*
+// @match        https://www.bilibili.com/list/watchlater*
+// @grant        none
+// @run-at       document-idle
+// @license      MIT
+// ==/UserScript==
+/*
+ * 思路致谢（MIT，未复制其代码）：
+ * - GF 541838「B站稍后观看时长统计助手」（特比欧炸）https://greasyfork.org/zh-CN/scripts/541838
+ *   → @match 作用域与深色适配思路
+ * - GF 438093「B站视频按播放数量过滤」（cakiihana）https://greasyfork.org/zh-CN/scripts/438093
+ *   → 阈值输入 / localStorage 持久化 / 隐藏-淡化交互模式
+ * 设计与验收：工作区《稍后再看播放量筛选_实施计划.md》
+ *
+ * 说明：
+ * - @grant none 是刻意选择：脚本运行在页面上下文，fetch 才能带 B 站 cookie 完成跨域。
+ * - 隐藏/淡化只增删自有 class（wlvf-hidden / wlvf-dim），绝不写内联 display，
+ *   避免恢复时把 B 站自己用 v-show 隐藏的卡片一起放出来。
+ * - v0.1.2：卡片选择器改为纯 class 匹配（不限标签），兼容「链接转换」类插件
+ *   将 div.video-card--grid 改写为 <a> 的场景；bvidOf 优先读卡片自身 href。
+ */
+
+(function () {
+  'use strict';
+
+  // ========== 选择器常量（B 站改版时只改这里） ==========
+  const SELECTORS = {
+    section: 'section.watchlater-list-container',
+    // 只按 class 匹配、不限标签：兼容链接转换插件把 div 改成 a 的情况
+    card: '.video-card--grid',
+    coverLink: 'a.bili-cover-card',
+    // 降级路径：第一个 stat 块（播放量）；F6 实测其文本即播放量缩写
+    firstStat: '.bili-cover-card__stats .bili-cover-card__stat',
+  };
+
+  const API_URL = 'https://api.bilibili.com/x/v2/history/toview';
+  const LS_KEY = { threshold: 'wlvf.threshold', enabled: 'wlvf.enabled', mode: 'wlvf.mode' };
+  const DEFAULT_THRESHOLD = 10000;
+  const CLS = { hide: 'wlvf-hidden', dim: 'wlvf-dim' };
+  const INPUT_DEBOUNCE = 200;
+  const APPLY_DEBOUNCE = 120;
+
+  // ========== 状态 ==========
+  const state = {
+    viewMap: new Map(),   // bvid -> 精确播放量
+    total: 0,             // 全量条数（接口）
+    degraded: false,      // true = 接口不可用，走 DOM 缩写解析
+    degradeReason: '',
+    enabled: false,       // 默认不启用（Q2）
+    mode: 'hide',         // 'hide' | 'dim'，默认隐藏（Q2）
+    threshold: DEFAULT_THRESHOLD, // null = 不筛（清空输入时）
+    peek: false,          // 临时显示全部（不改阈值）
+    unmatched: 0,
+    skipped: 0,           // BV 提取失败而跳过的卡片数
+  };
+
+  // ========== 纯函数（单测对象） ==========
+  /** 严格全匹配解析播放量缩写："2.1万"→21000，"763"→763，"1.2亿"→1.2e8，拼接串/非法→NaN */
+  function parseCount(s) {
+    const m = String(s == null ? '' : s).trim().match(/^([\d.]+)\s*([万亿])?$/);
+    if (!m) return NaN;
+    const n = Number(m[1]);
+    return m[2] === '亿' ? n * 1e8 : m[2] === '万' ? n * 1e4 : n;
+  }
+  /** 阈值输入："10000"/"1.5万"/"2亿" → 数值；空串 → null（不筛）；非法 → null */
+  function parseThreshold(s) {
+    const t = String(s == null ? '' : s).trim();
+    if (!t) return null;
+    const v = parseCount(t);
+    return Number.isFinite(v) ? v : null;
+  }
+  /** 判定恒为 ≥（Q1）：不达标 → false。NaN 交给调用方按「宁可漏筛」处理 */
+  function passes(view, threshold) {
+    return view >= threshold;
+  }
+
+  // ========== 持久化 ==========
+  function loadConfig() {
+    try {
+      const t = localStorage.getItem(LS_KEY.threshold);
+      state.threshold = t === null ? DEFAULT_THRESHOLD : parseThreshold(t);
+      state.enabled = localStorage.getItem(LS_KEY.enabled) === '1';
+      state.mode = localStorage.getItem(LS_KEY.mode) === 'dim' ? 'dim' : 'hide';
+    } catch (e) { /* localStorage 不可用则全走默认值 */ }
+  }
+  function saveConfig() {
+    try {
+      localStorage.setItem(LS_KEY.threshold, state.threshold == null ? '' : String(state.threshold));
+      localStorage.setItem(LS_KEY.enabled, state.enabled ? '1' : '0');
+      localStorage.setItem(LS_KEY.mode, state.mode);
+    } catch (e) { /* 忽略 */ }
+  }
+
+  // ========== 数据层 ==========
+  async function loadViewMap() {
+    setStatus('数据源：加载中 …');
+    try {
+      // 必须绝对地址：相对路径会打到 www 拿回 HTML（S0 实测教训）
+      const r = await fetch(API_URL, { credentials: 'include' });
+      const d = await r.json();
+      if (d.code !== 0 || !d.data || !Array.isArray(d.data.list)) {
+        throw new Error('toview 响应异常 code=' + (d && d.code));
+      }
+      const map = new Map();
+      for (const it of d.data.list) {
+        if (it.bvid && it.stat && typeof it.stat.view === 'number') {
+          map.set(it.bvid, it.stat.view);
+        }
+      }
+      state.viewMap = map;
+      state.total = d.data.list.length;
+      state.degraded = false;
+      state.degradeReason = '';
+    } catch (e) {
+      state.degraded = true;
+      state.degradeReason = String((e && e.message) || e);
+      state.viewMap = new Map();
+      // Q7 已定：面板黄色提示 + 控制台一行，不弹窗
+      console.warn('[播放量筛选] 列表接口不可用，降级为卡片缩写解析（误差约 ±5%）：', state.degradeReason);
+    }
+    applyAll();
+  }
+
+  // ========== 卡片识别与过滤 ==========
+  /** 从 href 提取 BV：兼容 ?bvid=BV… 和 /video/BV… 两种格式（Edge 与 Chrome 渲染路径不同） */
+  function extractBv(href) {
+    if (!href) return null;
+    const m = href.match(/bvid=(BV[0-9A-Za-z]+)/) || href.match(/\/video\/(BV[0-9A-Za-z]+)/);
+    return m ? m[1] : null;
+  }
+  function bvidOf(card) {
+    // 0. 卡片本身就是 <a>（链接转换插件把 div 改成 a 时）：直接取自身 href
+    if (card.getAttribute) {
+      const bv = extractBv(card.getAttribute('href'));
+      if (bv) return bv;
+    }
+    // 1. 优先从 a.bili-cover-card 取；兼容它 href 格式差异
+    const a = card.querySelector(SELECTORS.coverLink);
+    if (a) {
+      const bv = extractBv(a.getAttribute('href'));
+      if (bv) return bv;
+    }
+    // 2. 兜底：扫卡片内所有 <a>，找第一个含 BV 的 href
+    const links = card.querySelectorAll('a[href]');
+    for (const link of links) {
+      const bv = extractBv(link.getAttribute('href'));
+      if (bv) return bv;
+    }
+    return null;
+  }
+  function viewOf(card, bvid) {
+    if (state.degraded) {
+      const st = card.querySelector(SELECTORS.firstStat);
+      return st ? parseCount(st.textContent) : NaN;
+    }
+    return state.viewMap.has(bvid) ? state.viewMap.get(bvid) : NaN;
+  }
+  function clearCard(card) {
+    card.classList.remove(CLS.hide, CLS.dim);
+  }
+  function markFiltered(card) {
+    if (state.mode === 'dim') {
+      card.classList.remove(CLS.hide);
+      card.classList.add(CLS.dim);
+    } else {
+      card.classList.remove(CLS.dim);
+      card.classList.add(CLS.hide);
+    }
+  }
+
+  let applyTimer = 0;
+  function scheduleApply() {
+    // 节流：已有待执行的 applyAll 就不重置计时器，防止连续 class 变动把执行饿死
+    if (applyTimer) return;
+    applyTimer = setTimeout(() => { applyTimer = 0; applyAll(); }, APPLY_DEBOUNCE);
+  }
+
+  function applyAll() {
+    const section = document.querySelector(SELECTORS.section);
+    if (!section) return;
+    const cards = section.querySelectorAll(SELECTORS.card);
+    const filtering = state.enabled && !state.peek && state.threshold != null;
+    let hidden = 0;
+    let unmatched = 0;
+    let skipped = 0;
+    for (const card of cards) {
+      if (!filtering) { clearCard(card); continue; }
+      const bv = bvidOf(card);
+      if (!bv) {
+        // BV 提不到（占位卡 / DOM 未就绪）：清掉残留 class，宁可漏筛不可误藏
+        clearCard(card);
+        skipped++;
+        continue;
+      }
+      const v = viewOf(card, bv);
+      if (!Number.isFinite(v)) {
+        unmatched++;
+        clearCard(card); // 宁可漏筛，不可误杀
+        continue;
+      }
+      if (passes(v, state.threshold)) clearCard(card);
+      else { markFiltered(card); hidden++; }
+    }
+    state.unmatched = unmatched;
+    state.skipped = skipped;
+    updateStatus({ rendered: cards.length, hidden });
+  }
+
+  // ========== 状态栏 ==========
+  function updateStatus({ rendered, hidden }) {
+    const st = document.getElementById('wlvf-status');
+    const ds = document.getElementById('wlvf-source');
+    if (!st || !ds) return;
+    if (state.peek && state.enabled) {
+      st.textContent = '临时显示全部 · 阈值未变';
+    } else if (!state.enabled) {
+      st.textContent = '已停用 · 全部还原';
+    } else if (state.threshold == null) {
+      st.textContent = '阈值为空 · 未筛选';
+    } else {
+      const verb = state.mode === 'dim' ? '已淡化' : '已隐藏';
+      st.textContent = verb + ' ' + hidden + ' / 可见 ' + (rendered - hidden) + ' · 全量 ' + state.total;
+    }
+    if (state.degraded) {
+      ds.textContent = '数据源：卡片缩写（精度受限）⚠ ' + state.degradeReason;
+      ds.className = 'wlvf-warn';
+    } else {
+      ds.textContent = '数据源：接口精确值 ✓  未匹配 ' + state.unmatched +
+        (state.skipped ? ' · 跳过 ' + state.skipped : '');
+      ds.className = '';
+    }
+  }
+  function setStatus(text) {
+    const st = document.getElementById('wlvf-status');
+    if (st) st.textContent = text;
+  }
+
+  // ========== UI ==========
+  const CSS = [
+    '.wlvf-hidden{display:none !important;}',
+    '.wlvf-dim{opacity:.22 !important;transition:opacity .15s;}',
+    '.wlvf-panel{position:fixed;top:76px;right:18px;z-index:99999;width:256px;',
+    '  padding:12px 14px;border-radius:12px;',
+    '  font:12px/1.75 -apple-system,"Segoe UI","Microsoft YaHei",sans-serif;',
+    '  background:var(--wlvf-bg);color:var(--wlvf-fg);border:1px solid var(--wlvf-border);',
+    '  --wlvf-bg:#ffffffF2;--wlvf-fg:#2c2c2a;--wlvf-border:#d3d1c7;',
+    '  --wlvf-muted:#5f5e5a;--wlvf-accent:#534ab7;--wlvf-warn-bg:#faeeda;--wlvf-warn-fg:#854f0b;',
+    '  --wlvf-input-bg:#ffffff;--wlvf-btn-bg:#ffffff;}',
+    '@media (prefers-color-scheme:dark){.wlvf-panel{',
+    '  --wlvf-bg:#26212cF2;--wlvf-fg:#f1efe8;--wlvf-border:#5f5e5a;',
+    '  --wlvf-muted:#b4b2a9;--wlvf-accent:#afa9ec;--wlvf-warn-bg:#412402;--wlvf-warn-fg:#fac775;',
+    '  --wlvf-input-bg:#2c2c2a;--wlvf-btn-bg:#2c2c2a;}}',
+    '.wlvf-panel input[type=text]{width:86px;padding:2px 8px;border-radius:8px;',
+    '  border:1px solid var(--wlvf-border);background:var(--wlvf-input-bg);color:var(--wlvf-fg);',
+    '  font-size:12px;outline:none;}',
+    '.wlvf-panel input[type=text]:focus{border-color:var(--wlvf-accent);}',
+    '.wlvf-panel button{padding:3px 10px;border-radius:8px;cursor:pointer;font-size:12px;',
+    '  border:1px solid var(--wlvf-border);background:var(--wlvf-btn-bg);color:var(--wlvf-fg);}',
+    '.wlvf-panel button:hover{border-color:var(--wlvf-accent);color:var(--wlvf-accent);}',
+    '.wlvf-row{display:flex;flex-wrap:wrap;align-items:center;gap:6px 10px;}',
+    '.wlvf-panel label{display:inline-flex;align-items:center;gap:3px;cursor:pointer;user-select:none;}',
+    '.wlvf-muted{color:var(--wlvf-muted);}',
+    '.wlvf-warn{color:var(--wlvf-warn-fg);background:var(--wlvf-warn-bg);',
+    '  border-radius:6px;padding:1px 6px;}',
+    '.wlvf-div{height:1px;background:var(--wlvf-border);margin:8px 0;}',
+    '.wlvf-title{font-weight:500;margin:0 0 6px;}',
+  ].join('\n');
+
+  function buildPanel() {
+    if (document.getElementById('wlvf-panel')) return;
+    const style = document.createElement('style');
+    style.textContent = CSS;
+    document.head.appendChild(style);
+
+    const panel = document.createElement('div');
+    panel.id = 'wlvf-panel';
+    panel.className = 'wlvf-panel';
+    panel.innerHTML = [
+      '<div class="wlvf-title">播放量筛选</div>',
+      '<div class="wlvf-row">',
+      '  <span>播放量 ≥</span>',
+      '  <input id="wlvf-threshold" type="text" placeholder="如 1.5万" title="支持纯数字 / 1.5万 / 2亿；清空 = 不筛">',
+      '</div>',
+      '<div class="wlvf-row">',
+      '  <label><input id="wlvf-enabled" type="checkbox">启用</label>',
+      '  <label><input name="wlvf-mode" type="radio" value="hide">隐藏</label>',
+      '  <label><input name="wlvf-mode" type="radio" value="dim">淡化</label>',
+      '  <button id="wlvf-peek" type="button">临时显示全部</button>',
+      '</div>',
+      '<div class="wlvf-div"></div>',
+      '<div id="wlvf-status" class="wlvf-muted"></div>',
+      '<div id="wlvf-source" class="wlvf-muted"></div>',
+      '<div class="wlvf-row" style="margin-top:8px">',
+      '  <button id="wlvf-refresh" type="button">刷新数据</button>',
+      '  <button id="wlvf-recalc" type="button">立即重算</button>',
+      '</div>',
+    ].join('');
+    document.body.appendChild(panel);
+
+    // —— 控件初值（默认：阈值 10000、不启用、隐藏模式）——
+    const thInput = panel.querySelector('#wlvf-threshold');
+    thInput.value = state.threshold == null ? '' : String(state.threshold);
+    panel.querySelector('#wlvf-enabled').checked = state.enabled;
+    const modeRadio = panel.querySelector('input[name="wlvf-mode"][value="' + state.mode + '"]');
+    if (modeRadio) modeRadio.checked = true;
+
+    // —— 事件绑定（change + click 双保险，解决部分环境下 change 不稳定） ——
+    let inputTimer = 0;
+    thInput.addEventListener('input', () => {
+      clearTimeout(inputTimer);
+      inputTimer = setTimeout(() => {
+        state.threshold = parseThreshold(thInput.value);
+        saveConfig();
+        applyAll();
+      }, INPUT_DEBOUNCE);
+    });
+    const enInput = panel.querySelector('#wlvf-enabled');
+    function onEnableToggle() {
+      state.enabled = enInput.checked;
+      saveConfig();
+      applyAll();
+    }
+    enInput.addEventListener('change', onEnableToggle);
+    enInput.addEventListener('click', () => setTimeout(onEnableToggle, 0));
+    panel.querySelectorAll('input[name="wlvf-mode"]').forEach((r) => {
+      function onModeToggle() {
+        if (!r.checked) return;
+        state.mode = r.value === 'dim' ? 'dim' : 'hide';
+        saveConfig();
+        applyAll();
+      }
+      r.addEventListener('change', onModeToggle);
+      r.addEventListener('click', () => setTimeout(onModeToggle, 0));
+    });
+    panel.querySelector('#wlvf-peek').addEventListener('click', (e) => {
+      state.peek = !state.peek;
+      e.target.textContent = state.peek ? '恢复筛选' : '临时显示全部';
+      applyAll();
+    });
+    panel.querySelector('#wlvf-refresh').addEventListener('click', () => loadViewMap());
+    panel.querySelector('#wlvf-recalc').addEventListener('click', () => applyAll());
+  }
+
+  // ========== 动态套用 ==========
+  let observer = null;
+  let observedSection = null;
+  function attachObserver() {
+    const section = document.querySelector(SELECTORS.section);
+    if (!section) return;
+    if (observer && observedSection === section) return;
+    if (observer) observer.disconnect();
+    observedSection = section;
+    observer = new MutationObserver(scheduleApply);
+    // childList+subtree: 无限滚动新增卡片、插件包一层 wrapper 也能捕获
+    // attributes+class: Vue 重渲染 / 插件改写 class 后自动补过滤
+    observer.observe(section, {
+      childList: true,
+      subtree: true,
+      attributes: true,
+      attributeFilter: ['class'],
+    });
+    scheduleApply();
+  }
+  function waitForSection(tries) {
+    if (document.querySelector(SELECTORS.section)) { attachObserver(); return; }
+    if ((tries || 0) > 100) return;
+    setTimeout(() => waitForSection((tries || 0) + 1), 200);
+  }
+
+  // ========== 启动 ==========
+  loadConfig();
+  buildPanel();
+  waitForSection(0);
+  loadViewMap();
+  // hash 路由 SPA：切视图不重载文档，回列表页时重挂观察者
+  window.addEventListener('hashchange', () => setTimeout(attachObserver, 300));
+})();
+
+// 供 node 单测提取（不影响运行）
+// __PURE_EXPORT__ parseCount parseThreshold passes
