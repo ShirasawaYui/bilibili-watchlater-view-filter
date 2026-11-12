@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         B站稍后再看 · 播放量筛选
 // @namespace    wlvf.mellie.local
-// @version      0.1.2
+// @version      0.2.0
 // @description  在 B 站稍后再看列表按播放量阈值筛选卡片（隐藏/淡化双模式）。判定恒为 ≥，默认阈值 10000、默认不启用，数据来自列表接口精确值。
 // @author       结衣 & 梅莉
 // @match        https://www.bilibili.com/watchlater/list*
@@ -28,6 +28,8 @@
  *   避免恢复时把 B 站自己用 v-show 隐藏的卡片一起放出来。
  * - v0.1.2：卡片选择器改为纯 class 匹配（不限标签），兼容「链接转换」类插件
  *   将 div.video-card--grid 改写为 <a> 的场景；bvidOf 优先读卡片自身 href。
+ * - v0.2.0：面板新增亮色/深色切换按钮；双主题取自 B 站界面实色（页面底色
+ *   微调一档作面板底 + 描边 + 投影，三层边界清晰），偏好持久化到 localStorage。
  */
 
 (function () {
@@ -44,7 +46,7 @@
   };
 
   const API_URL = 'https://api.bilibili.com/x/v2/history/toview';
-  const LS_KEY = { threshold: 'wlvf.threshold', enabled: 'wlvf.enabled', mode: 'wlvf.mode' };
+  const LS_KEY = { threshold: 'wlvf.threshold', enabled: 'wlvf.enabled', mode: 'wlvf.mode', theme: 'wlvf.theme' };
   const DEFAULT_THRESHOLD = 10000;
   const CLS = { hide: 'wlvf-hidden', dim: 'wlvf-dim' };
   const INPUT_DEBOUNCE = 200;
@@ -58,6 +60,7 @@
     degradeReason: '',
     enabled: false,       // 默认不启用（Q2）
     mode: 'hide',         // 'hide' | 'dim'，默认隐藏（Q2）
+    theme: 'light',       // 'light' | 'dark'，面板主题（v0.2.0，持久化）
     threshold: DEFAULT_THRESHOLD, // null = 不筛（清空输入时）
     peek: false,          // 临时显示全部（不改阈值）
     unmatched: 0,
@@ -91,6 +94,10 @@
       state.threshold = t === null ? DEFAULT_THRESHOLD : parseThreshold(t);
       state.enabled = localStorage.getItem(LS_KEY.enabled) === '1';
       state.mode = localStorage.getItem(LS_KEY.mode) === 'dim' ? 'dim' : 'hide';
+      const themeSaved = localStorage.getItem(LS_KEY.theme);
+      // 显式偏好优先；未设置时跟随系统主题
+      state.theme = (themeSaved === 'dark' || themeSaved === 'light') ? themeSaved
+        : (window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light');
     } catch (e) { /* localStorage 不可用则全走默认值 */ }
   }
   function saveConfig() {
@@ -98,6 +105,7 @@
       localStorage.setItem(LS_KEY.threshold, state.threshold == null ? '' : String(state.threshold));
       localStorage.setItem(LS_KEY.enabled, state.enabled ? '1' : '0');
       localStorage.setItem(LS_KEY.mode, state.mode);
+      localStorage.setItem(LS_KEY.theme, state.theme);
     } catch (e) { /* 忽略 */ }
   }
 
@@ -253,28 +261,49 @@
     '  padding:12px 14px;border-radius:12px;',
     '  font:12px/1.75 -apple-system,"Segoe UI","Microsoft YaHei",sans-serif;',
     '  background:var(--wlvf-bg);color:var(--wlvf-fg);border:1px solid var(--wlvf-border);',
-    '  --wlvf-bg:#ffffffF2;--wlvf-fg:#2c2c2a;--wlvf-border:#d3d1c7;',
-    '  --wlvf-muted:#5f5e5a;--wlvf-accent:#534ab7;--wlvf-warn-bg:#faeeda;--wlvf-warn-fg:#854f0b;',
-    '  --wlvf-input-bg:#ffffff;--wlvf-btn-bg:#ffffff;}',
-    '@media (prefers-color-scheme:dark){.wlvf-panel{',
-    '  --wlvf-bg:#26212cF2;--wlvf-fg:#f1efe8;--wlvf-border:#5f5e5a;',
-    '  --wlvf-muted:#b4b2a9;--wlvf-accent:#afa9ec;--wlvf-warn-bg:#412402;--wlvf-warn-fg:#fac775;',
-    '  --wlvf-input-bg:#2c2c2a;--wlvf-btn-bg:#2c2c2a;}}',
+    '  box-shadow:var(--wlvf-shadow);transition:background .2s,color .2s,border-color .2s;}',
+    // —— 亮色：取自 B 站亮色界面实色。面板底用 --bg2 灰一档浮在纯白页面上，
+    //    输入框回白色、描边 + 投影收边，三层边界互不粘连 ——
+    '.wlvf-theme-light{',
+    '  --wlvf-bg:#F6F7F8F2;--wlvf-fg:#18191C;--wlvf-border:#D5D9DE;',
+    '  --wlvf-muted:#61666D;--wlvf-accent:#00AEEC;--wlvf-warn-bg:#FAEEDA;--wlvf-warn-fg:#854F0B;',
+    '  --wlvf-input-bg:#FFFFFF;--wlvf-btn-bg:#FFFFFF;--wlvf-shadow:0 4px 16px rgba(0,0,0,.08);}',
+    // —— 深色：取自 B 站深色界面实色。面板底比页面 #17181A 提亮一档 #212226，
+    //    沉稳不突兀；输入框再提一档，描边 #3A3C42 把面板从页面上"抬"出来 ——
+    '.wlvf-theme-dark{',
+    '  --wlvf-bg:#212226F2;--wlvf-fg:#E7E9EB;--wlvf-border:#3A3C42;',
+    '  --wlvf-muted:#A2A7AE;--wlvf-accent:#0087BD;--wlvf-warn-bg:#412402;--wlvf-warn-fg:#FAC775;',
+    '  --wlvf-input-bg:#2A2B30;--wlvf-btn-bg:#2A2B30;--wlvf-shadow:0 4px 16px rgba(0,0,0,.45);}',
     '.wlvf-panel input[type=text]{width:86px;padding:2px 8px;border-radius:8px;',
     '  border:1px solid var(--wlvf-border);background:var(--wlvf-input-bg);color:var(--wlvf-fg);',
     '  font-size:12px;outline:none;}',
     '.wlvf-panel input[type=text]:focus{border-color:var(--wlvf-accent);}',
     '.wlvf-panel button{padding:3px 10px;border-radius:8px;cursor:pointer;font-size:12px;',
     '  border:1px solid var(--wlvf-border);background:var(--wlvf-btn-bg);color:var(--wlvf-fg);}',
-    '.wlvf-panel button:hover{border-color:var(--wlvf-accent);color:var(--wlvf-accent);}',
+    '.wlvf-panel button:hover{border-color:var(--wlvf-accent);}',
     '.wlvf-row{display:flex;flex-wrap:wrap;align-items:center;gap:6px 10px;}',
     '.wlvf-panel label{display:inline-flex;align-items:center;gap:3px;cursor:pointer;user-select:none;}',
     '.wlvf-muted{color:var(--wlvf-muted);}',
     '.wlvf-warn{color:var(--wlvf-warn-fg);background:var(--wlvf-warn-bg);',
     '  border-radius:6px;padding:1px 6px;}',
     '.wlvf-div{height:1px;background:var(--wlvf-border);margin:8px 0;}',
-    '.wlvf-title{font-weight:500;margin:0 0 6px;}',
+    '.wlvf-title{display:flex;justify-content:space-between;align-items:center;',
+    '  font-weight:500;margin:0 0 6px;}',
+    '.wlvf-theme-btn{padding:1px 8px;font-size:11px;border-radius:7px;}',
   ].join('\n');
+
+  /** 应用面板主题（亮/深），并同步按钮文案 */
+  function applyTheme() {
+    const p = document.getElementById('wlvf-panel');
+    if (!p) return;
+    p.classList.remove('wlvf-theme-light', 'wlvf-theme-dark');
+    p.classList.add(state.theme === 'dark' ? 'wlvf-theme-dark' : 'wlvf-theme-light');
+    const btn = document.getElementById('wlvf-theme');
+    if (btn) {
+      btn.textContent = state.theme === 'dark' ? '亮色' : '暗色';
+      btn.title = state.theme === 'dark' ? '切换到亮色模式' : '切换到深色模式';
+    }
+  }
 
   function buildPanel() {
     if (document.getElementById('wlvf-panel')) return;
@@ -286,7 +315,9 @@
     panel.id = 'wlvf-panel';
     panel.className = 'wlvf-panel';
     panel.innerHTML = [
-      '<div class="wlvf-title">播放量筛选</div>',
+      '<div class="wlvf-title"><span>播放量筛选</span>',
+      '  <button id="wlvf-theme" class="wlvf-theme-btn" type="button">暗色</button>',
+      '</div>',
       '<div class="wlvf-row">',
       '  <span>播放量 ≥</span>',
       '  <input id="wlvf-threshold" type="text" placeholder="如 1.5万" title="支持纯数字 / 1.5万 / 2亿；清空 = 不筛">',
@@ -349,6 +380,13 @@
     });
     panel.querySelector('#wlvf-refresh').addEventListener('click', () => loadViewMap());
     panel.querySelector('#wlvf-recalc').addEventListener('click', () => applyAll());
+    // 亮/深切换：一按即换，偏好立即持久化
+    panel.querySelector('#wlvf-theme').addEventListener('click', () => {
+      state.theme = state.theme === 'dark' ? 'light' : 'dark';
+      saveConfig();
+      applyTheme();
+    });
+    applyTheme();
   }
 
   // ========== 动态套用 ==========
