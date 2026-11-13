@@ -14,6 +14,7 @@
 - **配置持久化**：阈值、启用状态、模式、面板主题自动保存到 localStorage，刷新不丢
 - **亮 / 深主题切换**：面板标题栏一键切换亮色、深色；配色取自 B 站界面实色（面板底色比页面提/沉一档 + 描边 + 投影），暗色沉稳不突兀，控件边界清晰
 - **降级容错**：接口不可用时自动降级为解析卡片缩写文本（约 ±5% 误差），面板黄色提示
+- **只在列表页运行**（v0.2.1）：稍后再看连播播放页 `/list/watchlater?...&bvid=...` 不注入、不建面板、不请求接口；从列表页 SPA 进出播放页时自动装卸，返回列表即恢复
 
 ## 安装
 
@@ -76,7 +77,12 @@ MutationObserver 检测 DOM 变动 → applyAll()
 
 - 不写内联 `display`，只增删自有 class，恢复时不干扰 B 站自身的 `v-show` 状态
 - `@grant none`，运行在页面上下文，直接搭页面自己的 fetch 携带 cookie
-- `@match` 仅限定 `watchlater/list*` 和 `list/watchlater*` 两个路径，不影响其他页面
+- **作用域三层保险**（v0.2.1）：
+  1. `@match` 限定 `watchlater/list*` 和 `list/watchlater*` 两个路径，不影响其他页面
+  2. B 站把连播播放页也放在 `/list/watchlater` 下，只是 URL 多了 `bvid` / `oid` 参数，故用 `@exclude *bvid*` 在注入阶段就排除
+  3. 运行时再以 URL 判定一次；并监听 `popstate` / `hashchange` / `pushState` / `replaceState`，SPA 切入播放页时移除面板、样式、观察者、轮询与在途请求，切回列表页时自动重建
+
+  这样播放页既不会在右上角多出一块面板，也不会有找列表容器的轮询和空跑的接口请求。
 
 ## 已知限制
 

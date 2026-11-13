@@ -1,11 +1,13 @@
 // ==UserScript==
 // @name         B站稍后再看 · 播放量筛选
 // @namespace    wlvf.mellie.local
-// @version      0.2.0
-// @description  在 B 站稍后再看列表按播放量阈值筛选卡片（隐藏/淡化双模式）。判定恒为 ≥，默认阈值 10000、默认不启用，数据来自列表接口精确值。
+// @version      0.2.1
+// @description  在 B 站稍后再看列表按播放量阈值筛选卡片（隐藏/淡化双模式），仅在列表页运行、播放页不启动。判定恒为 ≥，默认阈值 10000、默认不启用，数据来自列表接口精确值。
 // @author       结衣 & 梅莉
 // @match        https://www.bilibili.com/watchlater/list*
 // @match        https://www.bilibili.com/list/watchlater*
+// @exclude      https://www.bilibili.com/watchlater/list*bvid*
+// @exclude      https://www.bilibili.com/list/watchlater*bvid*
 // @grant        none
 // @run-at       document-idle
 // @license      MIT
@@ -30,6 +32,10 @@
  *   将 div.video-card--grid 改写为 <a> 的场景；bvidOf 优先读卡片自身 href。
  * - v0.2.0：面板新增亮色/深色切换按钮；双主题取自 B 站界面实色（页面底色
  *   微调一档作面板底 + 描边 + 投影，三层边界清晰），偏好持久化到 localStorage。
+ * - v0.2.1：只在「稍后再看列表页」运行。B 站把连播播放页也放在 /list/watchlater
+ *   下（?watchlater_cfg=…&oid=…&bvid=BV…），通配 @match 会把它一并匹配，导致面板
+ *   挂到播放页右上、列表容器轮询与接口 fetch 全部空转。修复 = 元数据 @exclude
+ *   在注入阶段挡掉 + 运行时 isWatchlaterListUrl 守卫 + SPA 路由监听进出时装卸。
  */
 
 (function () {
@@ -67,6 +73,11 @@
     skipped: 0,           // BV 提取失败而跳过的卡片数
   };
 
+  // ========== 生命周期句柄 ==========
+  let active = false;        // 当前是否处于列表页（播放页为 false，不做任何工作）
+  let sectionWaitTimer = 0;  // waitForSection 轮询句柄
+  let inputTimer = 0;        // 阈值输入防抖句柄
+
   // ========== 纯函数（单测对象） ==========
   /** 严格全匹配解析播放量缩写："2.1万"→21000，"763"→763，"1.2亿"→1.2e8，拼接串/非法→NaN */
   function parseCount(s) {
@@ -85,6 +96,14 @@
   /** 判定恒为 ≥（Q1）：不达标 → false。NaN 交给调用方按「宁可漏筛」处理 */
   function passes(view, threshold) {
     return view >= threshold;
+  }
+  /** 是否为「稍后再看列表页」。播放页复用 /list/watchlater 路径但带 bvid/oid，必须排除 */
+  function isWatchlaterListUrl(href) {
+    const u = new URL(String(href || ''), 'https://www.bilibili.com/');
+    const p = u.pathname.replace(/\/+$/, '');
+    if (p !== '/watchlater/list' && p !== '/list/watchlater') return false;
+    const q = u.searchParams;
+    return !(q.has('bvid') || q.has('oid') || /bvid=/.test(u.hash));
   }
 
   // ========== 持久化 ==========
@@ -111,6 +130,7 @@
 
   // ========== 数据层 ==========
   async function loadViewMap() {
+    if (!active) return;
     setStatus('数据源：加载中 …');
     try {
       // 必须绝对地址：相对路径会打到 www 拿回 HTML（S0 实测教训）
@@ -136,6 +156,8 @@
       // Q7 已定：面板黄色提示 + 控制台一行，不弹窗
       console.warn('[播放量筛选] 列表接口不可用，降级为卡片缩写解析（误差约 ±5%）：', state.degradeReason);
     }
+    // fetch 期间可能已 SPA 切到播放页：此时不写状态、不重算
+    if (!active) return;
     applyAll();
   }
 
@@ -194,6 +216,7 @@
   }
 
   function applyAll() {
+    if (!active) return;
     const section = document.querySelector(SELECTORS.section);
     if (!section) return;
     const cards = section.querySelectorAll(SELECTORS.card);
@@ -308,6 +331,7 @@
   function buildPanel() {
     if (document.getElementById('wlvf-panel')) return;
     const style = document.createElement('style');
+    style.id = 'wlvf-style';
     style.textContent = CSS;
     document.head.appendChild(style);
 
@@ -346,7 +370,6 @@
     if (modeRadio) modeRadio.checked = true;
 
     // —— 事件绑定（change + click 双保险，解决部分环境下 change 不稳定） ——
-    let inputTimer = 0;
     thInput.addEventListener('input', () => {
       clearTimeout(inputTimer);
       inputTimer = setTimeout(() => {
@@ -393,6 +416,7 @@
   let observer = null;
   let observedSection = null;
   function attachObserver() {
+    if (!active) return;
     const section = document.querySelector(SELECTORS.section);
     if (!section) return;
     if (observer && observedSection === section) return;
@@ -410,19 +434,69 @@
     scheduleApply();
   }
   function waitForSection(tries) {
+    if (!active) return;
     if (document.querySelector(SELECTORS.section)) { attachObserver(); return; }
     if ((tries || 0) > 100) return;
-    setTimeout(() => waitForSection((tries || 0) + 1), 200);
+    sectionWaitTimer = setTimeout(() => waitForSection((tries || 0) + 1), 200);
+  }
+
+  // ========== 按页面装卸 ==========
+  /** 进入播放页：撤掉面板/样式/观察者/定时器，并还原卡片 class（SPA 会复用 DOM） */
+  function teardown() {
+    if (!active) return;
+    active = false;
+    if (observer) { observer.disconnect(); observer = null; observedSection = null; }
+    clearTimeout(applyTimer); applyTimer = 0;
+    clearTimeout(sectionWaitTimer); sectionWaitTimer = 0;
+    clearTimeout(inputTimer); inputTimer = 0;
+    document.querySelectorAll('.' + CLS.hide + ',.' + CLS.dim).forEach(clearCard);
+    const p = document.getElementById('wlvf-panel');
+    if (p) p.remove();
+    const s = document.getElementById('wlvf-style');
+    if (s) s.remove();
+  }
+  function boot() {
+    if (active) return;
+    active = true;
+    loadConfig();
+    buildPanel();
+    waitForSection(0);
+    loadViewMap();
+  }
+  /** URL 变化后同步生命周期：列表页 → 启动；播放页 → 完全卸载 */
+  function syncActive() {
+    if (isWatchlaterListUrl(location.href)) {
+      if (!active) boot();
+      else attachObserver(); // hash 视图切换后 section 可能被替换，重挂观察者
+    } else {
+      teardown();
+    }
+  }
+  /** SPA 路由：pushState/replaceState 不触发 popstate，需一并挂钩 */
+  function installRouteWatch() {
+    const fire = () => setTimeout(syncActive, 0);
+    window.addEventListener('popstate', fire);
+    window.addEventListener('hashchange', fire);
+    const push = history.pushState;
+    const replace = history.replaceState;
+    history.pushState = function () {
+      const r = push.apply(this, arguments);
+      fire();
+      return r;
+    };
+    history.replaceState = function () {
+      const r = replace.apply(this, arguments);
+      fire();
+      return r;
+    };
   }
 
   // ========== 启动 ==========
-  loadConfig();
-  buildPanel();
-  waitForSection(0);
-  loadViewMap();
-  // hash 路由 SPA：切视图不重载文档，回列表页时重挂观察者
-  window.addEventListener('hashchange', () => setTimeout(attachObserver, 300));
+  // 直接打开播放页时守卫直接 return：不建面板、不轮询、不 fetch、不挂 observer。
+  // 从列表页 SPA 进出播放态时，由路由监听自动装卸。
+  installRouteWatch();
+  syncActive();
 })();
 
 // 供 node 单测提取（不影响运行）
-// __PURE_EXPORT__ parseCount parseThreshold passes
+// __PURE_EXPORT__ parseCount parseThreshold passes isWatchlaterListUrl
